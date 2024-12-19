@@ -1,10 +1,9 @@
-
 // Importa las dependencias necesarias
 const { onObjectFinalized } = require("firebase-functions/v2/storage");
 const { initializeApp } = require("firebase-admin/app");
 const { getStorage } = require("firebase-admin/storage");
 const { getFirestore, Timestamp, FieldValue } = require('firebase-admin/firestore');
-const logger = require("firebase-functions/logger");
+const { logger } = require("firebase-functions");
 const path = require("path");
 const os = require("os");
 const fs = require("fs").promises;
@@ -30,9 +29,9 @@ exports.processExcelFile = onObjectFinalized(
       return logger.log("El archivo no es un archivo Excel .xlsx");
     }
 
-    // Evita procesar archivos ya convertidos (si los identificas con un prefijo como "processed_")
+    // Evita procesar archivos ya convertidos (si los identificas con un prefijo como "libro_")
     const fileName = path.basename(filePath);
-    if (fileName.startsWith("processed_")) {
+    if (fileName.startsWith("libro_")) {
       return logger.log("El archivo ya fue procesado.");
     }
 
@@ -52,23 +51,48 @@ exports.processExcelFile = onObjectFinalized(
       const jsonData = XLSX.utils.sheet_to_json(worksheet);
       logger.log("Datos procesados del archivo Excel.");
 
-      // Genera un archivo JSON o CSV más liviano
-      const outputFileName = `processed_${path.basename(fileName, ".xlsx")}.json`;
-      const outputFilePath = path.join(os.tmpdir(), outputFileName);
-      fss.writeFileSync(outputFilePath, JSON.stringify(jsonData, null, 2));
-      logger.log(`Archivo JSON generado: ${outputFilePath}`);
+      // Organiza los datos por "Libro" y agrega "Libro" y "Ruta" a cada registro
+      const dataByLibro = {};
+      jsonData.forEach((row) => {
+        const codigoRuta = row["Codigo Ruta Suministro"];
+        if (codigoRuta && codigoRuta.length >= 10) {
+          const libro = codigoRuta.substring(4, 7); // Obtiene los dígitos del cuarto al séptimo
+          const ruta = codigoRuta.substring(7, 13); // Obtiene los últimos 6 dígitos
 
-      // Sube el archivo procesado al bucket de Firebase Storage
-      const outputStoragePath = path.join(path.dirname(filePath), outputFileName);
-      await bucket.upload(outputFilePath, {
-        destination: outputStoragePath,
-        metadata: { contentType: "application/json" },
+          if (!dataByLibro[libro]) {
+            dataByLibro[libro] = [];
+          }
+
+          dataByLibro[libro].push({
+            ...row,
+            Libro: libro,
+            Ruta: ruta,
+          });
+        }
       });
-      logger.log(`Archivo procesado subido a: ${outputStoragePath}`);
 
-      // Elimina archivos temporales
+      // Crea un archivo JSON por cada "Libro"
+      for (const [libro, records] of Object.entries(dataByLibro)) {
+        const outputFileName = `libro_${libro}.json`;
+        const outputFilePath = path.join(os.tmpdir(), outputFileName);
+
+        await fs.writeFile(outputFilePath, JSON.stringify(records, null, 2));
+        logger.log(`Archivo JSON generado para Libro ${libro}: ${outputFilePath}`);
+
+        // Sube el archivo procesado al bucket de Firebase Storage
+        const outputStoragePath = path.join(path.dirname(filePath), outputFileName);
+        await bucket.upload(outputFilePath, {
+          destination: outputStoragePath,
+          metadata: { contentType: "application/json" },
+        });
+        logger.log(`Archivo procesado subido a: ${outputStoragePath}`);
+
+        // Elimina el archivo temporal
+        fss.unlinkSync(outputFilePath);
+      }
+
+      // Elimina el archivo Excel temporal
       fss.unlinkSync(tempFilePath);
-      fss.unlinkSync(outputFilePath);
       logger.log("Archivos temporales eliminados.");
 
     } catch (error) {
@@ -78,55 +102,64 @@ exports.processExcelFile = onObjectFinalized(
 );
 
 
+
 //
 
-exports.processJsonFile = onObjectFinalized({
-  timeoutSeconds: 540, // Tiempo máximo de ejecución
-  memory: "2GiB",      // Memoria asignada
-}, async (event) => {
-  const bucketName = event.data.bucket; // Nombre del bucket
-  const fileName = event.data.name;    // Nombre del archivo subido
+// Función para procesar archivos JSON y guardar en Firestore
+exports.processJsonFile = onObjectFinalized(
+  {
+    timeoutSeconds: 540, // Tiempo máximo de ejecución
+    memory: "2GiB", // Memoria asignada
+    retry: true, // Habilita reintentos en caso de error
+  },
+  async (event) => {
+    const bucketName = event.data.bucket; // Nombre del bucket
+    const fileName = event.data.name; // Nombre del archivo subido
 
-  // Verifica que el archivo sea un JSON
-  if (!fileName.endsWith(".json")) {
-    console.log(`Archivo ignorado: ${fileName}`);
-    return;
+    // Verifica que el archivo sea un JSON
+    if (!fileName.endsWith(".json")) {
+      logger.log(`Archivo ignorado: ${fileName}`);
+      return;
+    }
+
+    const bucket = getStorage().bucket(bucketName);
+    const tempFilePath = path.join(os.tmpdir(), fileName); // Archivo temporal en /tmp
+
+    try {
+      // Descarga el archivo JSON desde Cloud Storage al directorio temporal
+      await bucket.file(fileName).download({ destination: tempFilePath });
+      logger.log(`Archivo descargado a ${tempFilePath}`);
+
+      // Lee el archivo JSON
+      const jsonData = await fs.readFile(tempFilePath, "utf8");
+      const data = JSON.parse(jsonData);
+
+      // Determina el nombre de la colección basado en el nombre del archivo
+      const collectionName = path.basename(fileName, path.extname(fileName));
+
+      // Referencia a Firestore
+      const db = getFirestore();
+
+      // Guarda cada elemento en Firestore
+      const batch = db.batch(); // Usa un batch para operaciones atómicas y más rápidas
+
+      data.forEach((item, index) => {
+        // Usa un ID único para cada documento
+        const docRef = db.collection(collectionName).doc(item.id || `doc_${index}`);
+        batch.set(docRef, item);
+      });
+
+      // Confirma la operación batch
+      await batch.commit();
+      logger.log(`Datos guardados en la colección '${collectionName}' en Firestore correctamente.`);
+
+    } catch (error) {
+      logger.error("Error procesando el archivo JSON:", error);
+      throw error; // Lanza el error para activar reintentos
+    } finally {
+      // Limpia el archivo temporal
+      await fs.unlink(tempFilePath);
+      logger.log("Archivo temporal eliminado.");
+    }
   }
-
-  const bucket = getStorage().bucket(bucketName);
-  const tempFilePath = path.join("/tmp", fileName); // Archivo temporal en /tmp
-
-  try {
-    // Descarga el archivo JSON desde Cloud Storage al directorio temporal
-    await bucket.file(fileName).download({ destination: tempFilePath });
-    console.log(`Archivo descargado a ${tempFilePath}`);
-
-    // Lee el archivo JSON
-    const jsonData = await fs.readFile(tempFilePath, "utf8");
-    const data = JSON.parse(jsonData);
-
-    // Referencia a Firestore
-    const db = getFirestore();
-
-    // Guarda cada elemento en Firestore
-    const batch = db.batch(); // Usa un batch para operaciones atómicas y más rápidas
-    const collectionName = "data"; // Cambia este nombre por el que necesites
-
-    data.forEach((item, index) => {
-      // Usa un ID único para cada documento
-      const docRef = db.collection(collectionName).doc(item.id || `doc_${index}`);
-      batch.set(docRef, item);
-    });
-
-    // Confirma la operación batch
-    await batch.commit();
-    console.log("Datos guardados en Firestore correctamente.");
-
-  } catch (error) {
-    console.error("Error procesando el archivo JSON:", error);
-  } finally {
-    // Limpia el archivo temporal
-    await fs.unlink(tempFilePath);
-    console.log("Archivo temporal eliminado.");
-  }
-});
+);
