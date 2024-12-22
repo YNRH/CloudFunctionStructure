@@ -2,13 +2,18 @@
 const { onObjectFinalized } = require("firebase-functions/v2/storage");
 const { initializeApp } = require("firebase-admin/app");
 const { getStorage } = require("firebase-admin/storage");
-const { getFirestore, Timestamp, FieldValue } = require('firebase-admin/firestore');
+const {
+  getFirestore,
+  Timestamp,
+  FieldValue,
+} = require("firebase-admin/firestore");
 const { logger } = require("firebase-functions");
 const path = require("path");
 const os = require("os");
 const fs = require("fs").promises;
 const fss = require("fs");
 const XLSX = require("xlsx");
+const {onRequest} = require("firebase-functions/v2/https");
 
 // Inicializa Firebase Admin
 initializeApp();
@@ -25,7 +30,12 @@ exports.processExcelFile = onObjectFinalized(
     const contentType = event.data.contentType; // Tipo de contenido del archivo
 
     // Verifica si el archivo es un Excel
-    if (!contentType || !contentType.includes("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")) {
+    if (
+      !contentType ||
+      !contentType.includes(
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+      )
+    ) {
       return logger.log("El archivo no es un archivo Excel .xlsx");
     }
 
@@ -77,10 +87,15 @@ exports.processExcelFile = onObjectFinalized(
         const outputFilePath = path.join(os.tmpdir(), outputFileName);
 
         await fs.writeFile(outputFilePath, JSON.stringify(records, null, 2));
-        logger.log(`Archivo JSON generado para Libro ${libro}: ${outputFilePath}`);
+        logger.log(
+          `Archivo JSON generado para Libro ${libro}: ${outputFilePath}`
+        );
 
         // Sube el archivo procesado al bucket de Firebase Storage
-        const outputStoragePath = path.join(path.dirname(filePath), outputFileName);
+        const outputStoragePath = path.join(
+          path.dirname(filePath),
+          outputFileName
+        );
         await bucket.upload(outputFilePath, {
           destination: outputStoragePath,
           metadata: { contentType: "application/json" },
@@ -95,21 +110,22 @@ exports.processExcelFile = onObjectFinalized(
       fss.unlinkSync(tempFilePath);
       logger.log("Archivos temporales eliminados.");
 
+      // Elimina el archivo Excel original de storage.
+      await bucket.file(filePath).delete();
+      logger.log(`Archivo Excel original  ${filePath}  eliminado de storage.`);
     } catch (error) {
       logger.error("Error al procesar el archivo:", error);
     }
   }
 );
 
-
-
 //
 
 // Función para procesar archivos JSON y guardar en Firestore
 exports.processJsonFile = onObjectFinalized(
   {
-    timeoutSeconds: 540, // Tiempo máximo de ejecución
-    memory: "2GiB", // Memoria asignada
+    timeoutSeconds: 300, // Tiempo máximo de ejecución
+    memory: "1GiB", // Memoria asignada
     retry: true, // Habilita reintentos en caso de error
   },
   async (event) => {
@@ -145,14 +161,21 @@ exports.processJsonFile = onObjectFinalized(
 
       data.forEach((item, index) => {
         // Usa un ID único para cada documento
-        const docRef = db.collection(collectionName).doc(item.id || `doc_${index}`);
+        const docRef = db
+          .collection(collectionName)
+          .doc(item.id || `doc_${index}`);
         batch.set(docRef, item);
       });
 
       // Confirma la operación batch
       await batch.commit();
-      logger.log(`Datos guardados en la colección '${collectionName}' en Firestore correctamente.`);
+      logger.log(
+        `Datos guardados en la colección '${collectionName}' en Firestore correctamente.`
+      );
 
+      // Elimina el archivo JSON de storage despues de cargarlo a firestore.
+      await bucket.file(fileName).delete();
+      logger.log(`Archivo JSON  ${fileName} eliminado de storage.`);
     } catch (error) {
       logger.error("Error procesando el archivo JSON:", error);
       throw error; // Lanza el error para activar reintentos
@@ -163,3 +186,58 @@ exports.processJsonFile = onObjectFinalized(
     }
   }
 );
+
+// BUSQUEDA
+
+exports.getLibroCollections = onRequest(async (req, res) => {
+  try {
+    const firestore = getFirestore();
+    const collections = await firestore.listCollections();
+
+    // Filter collections that start with "libro_"
+    const libroCollections = collections
+      .map((col) => col.id)
+      .filter((name) => name.startsWith("libro_"));
+
+    res.json({collections: libroCollections});
+  } catch (error) {
+    console.error("Error fetching collections:", error);
+    res.status(500).json({error: "Internal Server Error"});
+  }
+});
+
+exports.getDocumentsFromCollection = onRequest(async (req, res) => {
+  try {
+    const firestore = getFirestore();
+    const { collectionName, lastDocId } = req.query;
+
+    if (!collectionName) {
+      res.status(400).json({ error: "Collection name is required" });
+      return;
+    }
+
+    const query = firestore.collection(collectionName).orderBy("__name__").limit(10);
+    let snapshot;
+
+    if (lastDocId) {
+      const lastDoc = await firestore.collection(collectionName).doc(lastDocId).get();
+      if (!lastDoc.exists) {
+        res.status(400).json({ error: "Invalid lastDocId" });
+        return;
+      }
+      snapshot = await query.startAfter(lastDoc).get();
+    } else {
+      snapshot = await query.get();
+    }
+
+    const documents = snapshot.docs.map((doc) => ({
+      id: doc.id,
+      ...doc.data(),
+    }));
+
+    res.json({ documents });
+  } catch (error) {
+    console.error("Error fetching documents:", error);
+    res.status(500).json({ error: "Internal Server Error" });
+  }
+});
