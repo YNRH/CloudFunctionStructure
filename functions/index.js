@@ -241,3 +241,47 @@ exports.getDocumentsFromCollection = onRequest(async (req, res) => {
     res.status(500).json({ error: "Internal Server Error" });
   }
 });
+
+
+// Endpoint de búsqueda
+exports.searchMedidores = onRequest(async (req, res) => {
+  try {
+    const firestore = getFirestore();
+    const { collectionName, searchTerm, lastDocId, searchBy } = req.query;
+
+      if (!collectionName || !searchTerm || !searchBy) {
+          res.status(400).json({ error: "Collection name, search term, and searchBy field are required" });
+          return;
+      }
+
+
+    let query = firestore.collection(collectionName)
+                          .where(searchBy, '>=', searchTerm)
+                          .where(searchBy, '<=', searchTerm + '\uf8ff')
+                          .limit(10);
+    
+
+    let snapshot;
+    if (lastDocId) {
+        const lastDoc = await firestore.collection(collectionName).doc(lastDocId).get();
+        if (!lastDoc.exists) {
+            res.status(400).json({ error: "Invalid lastDocId" });
+            return;
+        }
+        query = query.startAfter(lastDoc);
+    }
+    
+    snapshot = await query.get();
+
+
+    const documents = snapshot.docs.map((doc) => ({
+        id: doc.id,
+        ...doc.data(),
+    }));
+
+    res.json({ documents });
+  } catch (error) {
+      console.error("Error searching documents:", error);
+      res.status(500).json({ error: "Internal Server Error" });
+  }
+});
