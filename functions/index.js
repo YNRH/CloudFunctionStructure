@@ -246,42 +246,73 @@ exports.getDocumentsFromCollection = onRequest(async (req, res) => {
 // Endpoint de búsqueda
 exports.searchMedidores = onRequest(async (req, res) => {
   try {
-    const firestore = getFirestore();
-    const { collectionName, searchTerm, lastDocId, searchBy } = req.query;
+      const firestore = getFirestore();
+      const { collectionName, searchTerm, lastDocId, searchBy } = req.query;
 
       if (!collectionName || !searchTerm || !searchBy) {
           res.status(400).json({ error: "Collection name, search term, and searchBy field are required" });
           return;
       }
 
+      const searchTermLower = searchTerm.toLowerCase();
 
-    let query = firestore.collection(collectionName)
-                          .where(searchBy, '>=', searchTerm)
-                          .where(searchBy, '<=', searchTerm + '\uf8ff')
-                          .limit(10);
-    
+      let query = firestore.collection(collectionName)
+          .where(searchBy, '>=', searchTerm.toUpperCase())
+          .where(searchBy, '<=', searchTerm.toUpperCase() + '\uf8ff')
+          .limit(10);
 
-    let snapshot;
-    if (lastDocId) {
-        const lastDoc = await firestore.collection(collectionName).doc(lastDocId).get();
-        if (!lastDoc.exists) {
-            res.status(400).json({ error: "Invalid lastDocId" });
-            return;
-        }
-        query = query.startAfter(lastDoc);
-    }
-    
-    snapshot = await query.get();
+      let snapshot;
+      if (lastDocId) {
+          const lastDoc = await firestore.collection(collectionName).doc(lastDocId).get();
+          if (!lastDoc.exists) {
+              res.status(400).json({ error: "Invalid lastDocId" });
+              return;
+          }
+          query = query.startAfter(lastDoc);
+      }
+      
+      snapshot = await query.get();
 
+      const documents = snapshot.docs.map((doc) => {
+          const data = doc.data();
+          return {
+              id: doc.id,
+              // Retornar solo los 3 campos necesarios para la lista
+              'Nombre Suministro': data['Nombre Suministro'],
+              'Codigo Suministro': data['Codigo Suministro'],
+              'Direccion Predio': data['Direccion Predio'],
+          };
+      });
 
-    const documents = snapshot.docs.map((doc) => ({
-        id: doc.id,
-        ...doc.data(),
-    }));
-
-    res.json({ documents });
+      res.json({ documents });
   } catch (error) {
       console.error("Error searching documents:", error);
       res.status(500).json({ error: "Internal Server Error" });
   }
+});
+
+exports.getDocumentDetail = onRequest(async (req, res) => {
+try {
+   const firestore = getFirestore();
+   const { collectionName, documentId } = req.query;
+
+   if (!collectionName || !documentId) {
+       res.status(400).json({ error: "Collection name and document ID are required" });
+       return;
+   }
+
+   const docRef = firestore.collection(collectionName).doc(documentId);
+   const docSnap = await docRef.get();
+
+   if (!docSnap.exists) {
+       res.status(404).json({ error: "Document not found" });
+       return;
+   }
+
+   res.json({ document: { id: docSnap.id, ...docSnap.data() } });
+
+} catch (error) {
+   console.error("Error fetching document detail:", error);
+   res.status(500).json({ error: "Internal Server Error" });
+}
 });
