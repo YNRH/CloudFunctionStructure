@@ -246,48 +246,62 @@ exports.getDocumentsFromCollection = onRequest(async (req, res) => {
 // Endpoint de búsqueda
 exports.searchMedidores = onRequest(async (req, res) => {
   try {
-      const firestore = getFirestore();
-      const { collectionName, searchTerm, lastDocId, searchBy } = req.query;
+    const firestore = getFirestore();
+    const { collectionName, searchTerm, lastDocId, searchBy } = req.query;
 
-      if (!collectionName || !searchTerm || !searchBy) {
-          res.status(400).json({ error: "Collection name, search term, and searchBy field are required" });
-          return;
+    if (!collectionName || !searchTerm || !searchBy) {
+      res.status(400).json({ error: "Collection name, search term, and searchBy field are required" });
+      return;
+    }
+
+    let query = firestore.collection(collectionName);
+    
+    if (searchBy === 'Codigo Suministro') {
+      const searchTermNumber = Number(searchTerm);
+        if(isNaN(searchTermNumber)) {
+             res.status(400).json({ error: "Invalid search term for 'Codigo Suministro'. Must be a number." });
+            return;
+        }
+       query = query.where(searchBy, '>=', searchTermNumber)
+                    .where(searchBy, '<=', searchTermNumber);
+
+    } else {
+        const searchTermUpper = searchTerm.toUpperCase();
+        query = query.where(searchBy, '>=', searchTermUpper)
+                    .where(searchBy, '<=', searchTermUpper + '\uf8ff');
+    }
+
+
+     query = query.limit(10);
+    
+
+    let snapshot;
+    if (lastDocId) {
+      const lastDoc = await firestore.collection(collectionName).doc(lastDocId).get();
+      if (!lastDoc.exists) {
+        res.status(400).json({ error: "Invalid lastDocId" });
+        return;
       }
+      query = query.startAfter(lastDoc);
+    }
 
-      const searchTermLower = searchTerm.toLowerCase();
+    snapshot = await query.get();
 
-      let query = firestore.collection(collectionName)
-          .where(searchBy, '>=', searchTerm.toUpperCase())
-          .where(searchBy, '<=', searchTerm.toUpperCase() + '\uf8ff')
-          .limit(10);
+    const documents = snapshot.docs.map((doc) => {
+      const data = doc.data();
+      return {
+        id: doc.id,
+        // Retornar solo los 3 campos necesarios para la lista
+        'Nombre Suministro': data['Nombre Suministro'],
+        'Codigo Suministro': data['Codigo Suministro'],
+        'Direccion Predio': data['Direccion Predio'],
+      };
+    });
 
-      let snapshot;
-      if (lastDocId) {
-          const lastDoc = await firestore.collection(collectionName).doc(lastDocId).get();
-          if (!lastDoc.exists) {
-              res.status(400).json({ error: "Invalid lastDocId" });
-              return;
-          }
-          query = query.startAfter(lastDoc);
-      }
-      
-      snapshot = await query.get();
-
-      const documents = snapshot.docs.map((doc) => {
-          const data = doc.data();
-          return {
-              id: doc.id,
-              // Retornar solo los 3 campos necesarios para la lista
-              'Nombre Suministro': data['Nombre Suministro'],
-              'Codigo Suministro': data['Codigo Suministro'],
-              'Direccion Predio': data['Direccion Predio'],
-          };
-      });
-
-      res.json({ documents });
+    res.json({ documents });
   } catch (error) {
-      console.error("Error searching documents:", error);
-      res.status(500).json({ error: "Internal Server Error" });
+    console.error("Error searching documents:", error);
+    res.status(500).json({ error: "Internal Server Error" });
   }
 });
 
